@@ -16,6 +16,7 @@ Compression levels:
 
 Dependency: Ghostscript.
 On MacOSX install via command line `brew install ghostscript`.
+On Arch Linux install via command line `sudo pacman -S ghostscript`.
 """
 
 import argparse
