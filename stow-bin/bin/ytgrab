@@ -30,7 +30,13 @@ def download_videos(input_file, audio_only=False, upload=False):
     # Read URLs from input
     if input_file == "-":
         try:
-            urls = [line.strip() for line in sys.stdin if line.strip()]
+            urls = []
+            for line in sys.stdin:
+                line = line.strip()
+                if line.upper() == 'END':
+                    break
+                else:
+                    urls.append(line)
         except KeyboardInterrupt as e:
             print("\nReceived Stop Signal... Exiting\n")
             sys.exit(0)
