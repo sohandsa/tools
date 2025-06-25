@@ -96,7 +96,7 @@ def main():
     )
     #    parser.add_argument("-s", "--single", help="Download a single video")
     parser.add_argument(
-        "input_file", help="Text file with YouTube URLs (or '-' to read from stdin)"
+        "input_file", help="Text file with YouTube URLs (or '-' to read from stdin, CTRl+D to stop input)"
     )
     parser.add_argument(
         "--audio", action="store_true", help="Download audio only (as MP3)"
