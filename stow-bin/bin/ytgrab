@@ -8,6 +8,7 @@ import argparse
 
 
 def upload_to_drive(local_path, remote_folder="yt-uploads"):
+    # This function remains unchanged.
     remote_path = f"gdrive:{remote_folder}/{local_path.name}"
     print(f"☁️ Uploading {local_path} → {remote_path}")
     try:
@@ -19,94 +20,133 @@ def upload_to_drive(local_path, remote_folder="yt-uploads"):
         print("❌ Upload failed.")
 
 
-def download_videos(input_file, audio_only=False, upload=False):
+def download_videos(args): # <--- MODIFIED: Pass the whole args object
     today = datetime.date.today().isoformat()
     home = Path.home()
 
     # Choose output directory based on mode
-    base_dir = home / ("Music" if audio_only else "Videos") / today
+    base_dir = home / ("Music" if args.audio else "Videos") / today
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read URLs from input
-    if input_file == "-":
+    urls = []
+    # <--- MODIFIED: Logic to handle URL, stdin, or file input
+    if args.url:
+        urls.append(args.url)
+    elif args.input_file == "-":
+        print("Reading URLs from stdin. Press Ctrl+D (or Ctrl+Z on Windows) to finish.")
         try:
-            urls = []
             for line in sys.stdin:
-                line = line.strip()
-                if line.upper() == 'END':
-                    break
-                else:
-                    urls.append(line)
-        except KeyboardInterrupt as e:
+                urls.append(line.strip())
+        except KeyboardInterrupt:
             print("\nReceived Stop Signal... Exiting\n")
             sys.exit(0)
-    else:
+    elif args.input_file:
         try:
-            with open(input_file, "r") as f:
+            with open(args.input_file, "r") as f:
                 urls = [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
-            print(f"❌ Input file '{input_file}' not found.")
+            print(f"❌ Input file '{args.input_file}' not found.")
             sys.exit(1)
 
     if not urls:
-        print("⚠️ No valid URLs found.")
+        print("⚠️ No valid URLs found to process.")
         return
 
     for url in urls:
-        print(f"📥 Downloading: {url}")
-        if audio_only:
+        print(f"📥 Processing: {url}")
+        
+        # --- Base command setup ---
+        if args.audio:
             command = [
                 "yt-dlp",
-                "-f",
-                "bestaudio",
+                "-f", "bestaudio",
                 "--extract-audio",
-                "--audio-format",
-                "mp3",
-                "--audio-quality",
-                "0",  # best
-                "-o",
-                str(base_dir / "%(title)s.%(ext)s"),
-                url,
+                "--audio-format", "mp3",
+                "--audio-quality", "0", # best
+                "-o", str(base_dir / "%(title)s.%(ext)s"),
             ]
         else:
+            # <--- MODIFIED: This is the key to faster MP4 processing.
+            # Instead of re-encoding, we request a format that is already MP4.
+            # This avoids a slow conversion process unless an MP4 version isn't available.
             command = [
                 "yt-dlp",
-                "-f",
-                "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-                "--recode-video",
-                "mp4",
-                "-o",
-                str(base_dir / "%(title)s.%(ext)s"),
-                url,
+                "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
+                # We no longer need `--recode-video mp4` because we requested it in the format selection.
+                # yt-dlp will only re-mux if the container isn't MP4, which is very fast.
+                "-o", str(base_dir / "%(title)s.%(ext)s"),
             ]
+
+        # <--- MODIFIED: Add timestamp/clipping options if provided
+        if args.start and args.end:
+            # This requires ffmpeg to be installed. yt-dlp uses it for cutting.
+            time_range = f"*{args.start}-{args.end}"
+            command.extend(["--download-sections", time_range])
+            print(f"✂️  Applying time range: {args.start} to {args.end}")
+        
+        # --- Add the URL and run the command ---
+        command.append(url)
 
         try:
             subprocess.run(command, check=True)
+            print(f"✅ Successfully processed: {url}")
         except subprocess.CalledProcessError:
-            print(f"❌ Failed to download: {url}")
+            print(f"❌ Failed to process: {url}")
+        except FileNotFoundError:
+            print("❌ Error: 'yt-dlp' or 'ffmpeg' command not found.")
+            print("Please ensure both yt-dlp and ffmpeg are installed and in your system's PATH.")
+            sys.exit(1)
 
-        if upload:
-            print("Not Supported at this moment")
-            # upload_to_drive(base_dir)
+
+        if args.upload:
+            print("Upload feature is not fully implemented for individual files yet.")
+            # To make this work, you'd need to find the downloaded file path and pass it
+            # e.g., upload_to_drive(Path(downloaded_file_path))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download YouTube videos or MP3 audio."
+        description="Download YouTube videos or audio, with options for clipping and uploading.",
+        formatter_class=argparse.RawTextHelpFormatter # For better help text formatting
     )
-    #    parser.add_argument("-s", "--single", help="Download a single video")
+    # <--- MODIFIED: Use a mutually exclusive group for input type
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "-u", "--url",
+        help="Download a single video/audio from a URL."
+    )
+    input_group.add_argument(
+        "-i", "--input-file",
+        help="Text file with YouTube URLs (use '-' to read from stdin)."
+    )
+    
     parser.add_argument(
-        "input_file", help="Text file with YouTube URLs (or '-' to read from stdin, CTRl+D to stop input)"
+        "-a", "--audio",
+        action="store_true",
+        help="Download audio only (as MP3)."
     )
     parser.add_argument(
-        "--audio", action="store_true", help="Download audio only (as MP3)"
+        "--upload",
+        action="store_true",
+        help="Upload the downloaded files to Google Drive (requires rclone)."
+    )
+    # <--- MODIFIED: Add arguments for timestamps
+    parser.add_argument(
+        "--start",
+        help="Start time for video clipping (e.g., 00:01:30 or 1:30)."
     )
     parser.add_argument(
-        "--upload", action="store_true", help="Upload the folder to Google Drive"
+        "--end",
+        help="End time for video clipping (e.g., 00:02:45 or 2:45)."
     )
-    args = parser.parse_args()
 
-    download_videos(args.input_file, audio_only=args.audio, upload=args.upload)
+    args = parser.parse_args()
+    
+    # <--- MODIFIED: Simple validation for timestamps
+    if (args.start and not args.end) or (not args.start and args.end):
+        parser.error("--start and --end must be used together.")
+
+    download_videos(args) # <--- MODIFIED: Pass all args
 
 
 if __name__ == "__main__":
