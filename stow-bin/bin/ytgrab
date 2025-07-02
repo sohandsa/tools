@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import sys
+import re
 import datetime
 from pathlib import Path
 import subprocess
 import argparse
+from tqdm import tqdm
 
+pattern = re.compile(r"(https?://[^\s)]+)")
 
+# The upload_to_drive function remains unchanged
 def upload_to_drive(local_path, remote_folder="yt-uploads"):
-    # This function remains unchanged.
     remote_path = f"gdrive:{remote_folder}/{local_path.name}"
     print(f"☁️ Uploading {local_path} → {remote_path}")
     try:
@@ -20,30 +23,31 @@ def upload_to_drive(local_path, remote_folder="yt-uploads"):
         print("❌ Upload failed.")
 
 
-def download_videos(args): # <--- MODIFIED: Pass the whole args object
+def download_videos(args):
     today = datetime.date.today().isoformat()
     home = Path.home()
-
-    # Choose output directory based on mode
     base_dir = home / ("Music" if args.audio else "Videos") / today
     base_dir.mkdir(parents=True, exist_ok=True)
 
     urls = []
-    # <--- MODIFIED: Logic to handle URL, stdin, or file input
     if args.url:
         urls.append(args.url)
     elif args.input_file == "-":
         print("Reading URLs from stdin. Press Ctrl+D (or Ctrl+Z on Windows) to finish.")
         try:
-            for line in sys.stdin:
-                urls.append(line.strip())
+            urls = [line.strip() for line in sys.stdin if line.strip()]
         except KeyboardInterrupt:
             print("\nReceived Stop Signal... Exiting\n")
             sys.exit(0)
     elif args.input_file:
         try:
             with open(args.input_file, "r") as f:
-                urls = [line.strip() for line in f if line.strip()]
+                for line in f.readlines():
+                    match = pattern.search(line)
+                    if match:
+                        urls.append(match.group(1))
+                    else:
+                        print("URL not found in line")
         except FileNotFoundError:
             print(f"❌ Input file '{args.input_file}' not found.")
             sys.exit(1)
@@ -52,64 +56,71 @@ def download_videos(args): # <--- MODIFIED: Pass the whole args object
         print("⚠️ No valid URLs found to process.")
         return
 
-    for url in urls:
-        print(f"📥 Processing: {url}")
-        
-        # --- Base command setup ---
+    url_progress_bar = tqdm(urls, desc="Overall Progress", unit="video")
+    for url in url_progress_bar:
+        url_progress_bar.set_description(f"Processing {url[:50]}...")
+
+        # Base command arguments that are always present
+        base_command_args = [
+            "--progress",
+            "--ppa", "ffmpeg:-v quiet",
+        ]
+
+        # === LOGIC FOR BUILDING THE COMMAND ===
         if args.audio:
             command = [
                 "yt-dlp",
+                *base_command_args,
                 "-f", "bestaudio",
-                "--extract-audio",
-                "--audio-format", "mp3",
-                "--audio-quality", "0", # best
-                "-o", str(base_dir / "%(title)s.%(ext)s"),
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
             ]
-        else:
-            # <--- MODIFIED: This is the key to faster MP4 processing.
-            # Instead of re-encoding, we request a format that is already MP4.
-            # This avoids a slow conversion process unless an MP4 version isn't available.
-            command = [
-                "yt-dlp",
-                "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
-                # We no longer need `--recode-video mp4` because we requested it in the format selection.
-                # yt-dlp will only re-mux if the container isn't MP4, which is very fast.
-                "-o", str(base_dir / "%(title)s.%(ext)s"),
-            ]
+        else: # This is the video case
+            # <--- MODIFIED: Logic now splits for clipped vs. full video
+            if args.start and args.end:
+                # --- This is the new, robust command for CLIPPING videos ---
+                # We force re-encoding for the small clip to ensure it's valid.
+                command = [
+                    "yt-dlp",
+                    *base_command_args,
+                    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+                    "--recode", "mp4", # Crucial for reliable clips
+                ]
+            else:
+                # --- This is the original fast command for FULL videos ---
+                # We avoid re-encoding by requesting a pre-formatted MP4.
+                command = [
+                    "yt-dlp",
+                    *base_command_args,
+                    "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
+                ]
 
-        # <--- MODIFIED: Add timestamp/clipping options if provided
+        # Add timestamp/clipping options AFTER choosing the base command
         if args.start and args.end:
-            # This requires ffmpeg to be installed. yt-dlp uses it for cutting.
             time_range = f"*{args.start}-{args.end}"
             command.extend(["--download-sections", time_range])
-            print(f"✂️  Applying time range: {args.start} to {args.end}")
-        
-        # --- Add the URL and run the command ---
-        command.append(url)
+
+        # Add output path template and the URL itself
+        command.extend(["-o", str(base_dir / "%(title)s.%(ext)s"), url])
 
         try:
-            subprocess.run(command, check=True)
-            print(f"✅ Successfully processed: {url}")
-        except subprocess.CalledProcessError:
-            print(f"❌ Failed to process: {url}")
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            tqdm.write(f"❌ Failed to process: {url}")
+            tqdm.write(f"   Error: {e.stderr.decode('utf-8', errors='ignore')}")
         except FileNotFoundError:
-            print("❌ Error: 'yt-dlp' or 'ffmpeg' command not found.")
-            print("Please ensure both yt-dlp and ffmpeg are installed and in your system's PATH.")
+            tqdm.write("❌ Error: 'yt-dlp' or 'ffmpeg' command not found.")
+            tqdm.write("Please ensure both yt-dlp and ffmpeg are installed and in your system's PATH.")
             sys.exit(1)
 
-
         if args.upload:
-            print("Upload feature is not fully implemented for individual files yet.")
-            # To make this work, you'd need to find the downloaded file path and pass it
-            # e.g., upload_to_drive(Path(downloaded_file_path))
+            tqdm.write("Upload feature is not fully implemented for individual files yet.")
 
-
+# main() function remains unchanged
 def main():
     parser = argparse.ArgumentParser(
         description="Download YouTube videos or audio, with options for clipping and uploading.",
-        formatter_class=argparse.RawTextHelpFormatter # For better help text formatting
+        formatter_class=argparse.RawTextHelpFormatter
     )
-    # <--- MODIFIED: Use a mutually exclusive group for input type
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "-u", "--url",
@@ -119,35 +130,22 @@ def main():
         "-i", "--input-file",
         help="Text file with YouTube URLs (use '-' to read from stdin)."
     )
-    
     parser.add_argument(
-        "-a", "--audio",
-        action="store_true",
-        help="Download audio only (as MP3)."
+        "-a", "--audio", action="store_true", help="Download audio only (as MP3)."
     )
     parser.add_argument(
-        "--upload",
-        action="store_true",
-        help="Upload the downloaded files to Google Drive (requires rclone)."
-    )
-    # <--- MODIFIED: Add arguments for timestamps
-    parser.add_argument(
-        "--start",
-        help="Start time for video clipping (e.g., 00:01:30 or 1:30)."
+        "--upload", action="store_true", help="Upload the downloaded files to Google Drive (requires rclone)."
     )
     parser.add_argument(
-        "--end",
-        help="End time for video clipping (e.g., 00:02:45 or 2:45)."
+        "--start", help="Start time for video clipping (e.g., 00:01:30 or 1:30)."
     )
-
+    parser.add_argument(
+        "--end", help="End time for video clipping (e.g., 00:02:45 or 2:45)."
+    )
     args = parser.parse_args()
-    
-    # <--- MODIFIED: Simple validation for timestamps
     if (args.start and not args.end) or (not args.start and args.end):
         parser.error("--start and --end must be used together.")
-
-    download_videos(args) # <--- MODIFIED: Pass all args
-
+    download_videos(args)
 
 if __name__ == "__main__":
     main()
