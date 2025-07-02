@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import sys
-import re
 import datetime
 from pathlib import Path
 import subprocess
 import argparse
 from tqdm import tqdm
+import concurrent.futures # <--- MODIFIED: For parallel processing
+from functools import partial # <--- MODIFIED: To help pass arguments
+import re
 
-pattern = re.compile(r"(https?://[^\s)]+)")
+patter = re.compile(r"(https?://[^\s)]+)")
+
 
 # The upload_to_drive function remains unchanged
 def upload_to_drive(local_path, remote_folder="yt-uploads"):
@@ -22,6 +25,53 @@ def upload_to_drive(local_path, remote_folder="yt-uploads"):
     except subprocess.CalledProcessError:
         print("❌ Upload failed.")
 
+
+# <--- MODIFIED: New worker function to process a single URL
+def process_url(url, base_dir, args):
+    """
+    Constructs and runs the yt-dlp command for a single URL.
+    This function is designed to be called in parallel.
+    """
+    base_command_args = [
+        # Suppress all yt-dlp output to avoid garbled progress bars in parallel
+        "--quiet",
+        "--no-progress",
+        "--ppa", "ffmpeg:-v quiet",
+    ]
+
+    if args.audio:
+        command = [
+            "yt-dlp", *base_command_args,
+            "-f", "bestaudio",
+            "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+        ]
+    else:
+        if args.start and args.end:
+            command = [
+                "yt-dlp", *base_command_args,
+                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+                "--recode", "mp4",
+            ]
+        else:
+            command = [
+                "yt-dlp", *base_command_args,
+                "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
+            ]
+
+    if args.start and args.end:
+        time_range = f"*{args.start}-{args.end}"
+        command.extend(["--download-sections", time_range])
+
+    command.extend(["-o", str(base_dir / "%(title)s.%(ext)s"), url])
+
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return (url, True, None) # URL, Success, Error
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr.decode('utf-8', errors='ignore').strip()
+        return (url, False, error_message) # URL, Failure, Error
+    except FileNotFoundError:
+        return (url, False, "yt-dlp or ffmpeg not found.")
 
 def download_videos(args):
     today = datetime.date.today().isoformat()
@@ -42,12 +92,13 @@ def download_videos(args):
     elif args.input_file:
         try:
             with open(args.input_file, "r") as f:
-                for line in f.readlines():
-                    match = pattern.search(line)
+                for line_no, line in enumerate(f.readlines()):
+                    match = patter.search(line)
                     if match:
                         urls.append(match.group(1))
                     else:
-                        print("URL not found in line")
+                        print(f"[!] No URL found on line {line_no}: {line.strip()}")
+
         except FileNotFoundError:
             print(f"❌ Input file '{args.input_file}' not found.")
             sys.exit(1)
@@ -56,96 +107,61 @@ def download_videos(args):
         print("⚠️ No valid URLs found to process.")
         return
 
-    url_progress_bar = tqdm(urls, desc="Overall Progress", unit="video")
-    for url in url_progress_bar:
-        url_progress_bar.set_description(f"Processing {url[:50]}...")
+    # <--- MODIFIED: Parallel execution logic
+    # Use partial to create a version of process_url with the fixed arguments already filled in.
+    task_function = partial(process_url, base_dir=base_dir, args=args)
+    failures = []
 
-        # Base command arguments that are always present
-        base_command_args = [
-            "--progress",
-            "--ppa", "ffmpeg:-v quiet",
-        ]
+    print(f"🚀 Starting up to {args.parallel} parallel downloads...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        # Use executor.map to run the task on each URL.
+        # Wrap with tqdm for a single, clean progress bar.
+        results = list(tqdm(executor.map(task_function, urls), total=len(urls), desc="Overall Progress", unit="video"))
 
-        # === LOGIC FOR BUILDING THE COMMAND ===
-        if args.audio:
-            command = [
-                "yt-dlp",
-                *base_command_args,
-                "-f", "bestaudio",
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-            ]
-        else: # This is the video case
-            # <--- MODIFIED: Logic now splits for clipped vs. full video
-            if args.start and args.end:
-                # --- This is the new, robust command for CLIPPING videos ---
-                # We force re-encoding for the small clip to ensure it's valid.
-                command = [
-                    "yt-dlp",
-                    *base_command_args,
-                    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-                    "--recode", "mp4", # Crucial for reliable clips
-                ]
-            else:
-                # --- This is the original fast command for FULL videos ---
-                # We avoid re-encoding by requesting a pre-formatted MP4.
-                command = [
-                    "yt-dlp",
-                    *base_command_args,
-                    "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
-                ]
+    for url, success, error_msg in results:
+        if not success:
+            failures.append((url, error_msg))
 
-        # Add timestamp/clipping options AFTER choosing the base command
-        if args.start and args.end:
-            time_range = f"*{args.start}-{args.end}"
-            command.extend(["--download-sections", time_range])
+    if failures:
+        print("\n--- ❌ Some downloads failed ---")
+        for url, error_msg in failures:
+            tqdm.write(f"URL: {url}")
+            tqdm.write(f"Error: {error_msg}\n")
+    else:
+        print("\n✅ All downloads completed successfully!")
 
-        # Add output path template and the URL itself
-        command.extend(["-o", str(base_dir / "%(title)s.%(ext)s"), url])
 
-        try:
-            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            tqdm.write(f"❌ Failed to process: {url}")
-            tqdm.write(f"   Error: {e.stderr.decode('utf-8', errors='ignore')}")
-        except FileNotFoundError:
-            tqdm.write("❌ Error: 'yt-dlp' or 'ffmpeg' command not found.")
-            tqdm.write("Please ensure both yt-dlp and ffmpeg are installed and in your system's PATH.")
-            sys.exit(1)
-
-        if args.upload:
-            tqdm.write("Upload feature is not fully implemented for individual files yet.")
-
-# main() function remains unchanged
 def main():
     parser = argparse.ArgumentParser(
         description="Download YouTube videos or audio, with options for clipping and uploading.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument(
-        "-u", "--url",
-        help="Download a single video/audio from a URL."
-    )
-    input_group.add_argument(
-        "-i", "--input-file",
-        help="Text file with YouTube URLs (use '-' to read from stdin)."
-    )
+    input_group.add_argument("-u", "--url", help="Download a single video/audio from a URL.")
+    input_group.add_argument("-i", "--input-file", help="Text file with YouTube URLs (use '-' to read from stdin).")
+
+    # <--- MODIFIED: Added parallel argument
     parser.add_argument(
-        "-a", "--audio", action="store_true", help="Download audio only (as MP3)."
+        "-p", "--parallel", type=int, default=4,
+        help="Number of parallel downloads to run. Default is 4."
     )
-    parser.add_argument(
-        "--upload", action="store_true", help="Upload the downloaded files to Google Drive (requires rclone)."
-    )
-    parser.add_argument(
-        "--start", help="Start time for video clipping (e.g., 00:01:30 or 1:30)."
-    )
-    parser.add_argument(
-        "--end", help="End time for video clipping (e.g., 00:02:45 or 2:45)."
-    )
+
+    parser.add_argument("-a", "--audio", action="store_true", help="Download audio only (as MP3).")
+    parser.add_argument("--upload", action="store_true", help="Upload the downloaded files to Google Drive (requires rclone).")
+    parser.add_argument("--start", help="Start time for video clipping (e.g., 00:01:30 or 1:30).")
+    parser.add_argument("--end", help="End time for video clipping (e.g., 00:02:45 or 2:45).")
+
     args = parser.parse_args()
+
     if (args.start and not args.end) or (not args.start and args.end):
         parser.error("--start and --end must be used together.")
+
+    # Single URL download does not need parallel machinery
+    if args.url:
+        args.parallel = 1
+
     download_videos(args)
+
 
 if __name__ == "__main__":
     main()
